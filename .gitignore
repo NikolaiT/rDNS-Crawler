@@ -1,0 +1,36 @@
+# === Build artifacts ===
+/bin/
+/rdns-crawler
+rdns-crawler-linux-*
+*.exe
+
+# === Crawl output / data (large) ===
+/OUTPUT/
+*.rdnsz
+*.rdnsz.cursor
+*.jsonl
+*.tsv
+
+# === Secrets ===
+# Hetzner API token etc. live here — NEVER commit. The .example is safe.
+deploy/config.env
+*.env
+!*.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*_id_rsa
+*.p12
+
+# === Logs / tmp ===
+*.log
+*.tmp
+tmp/
+
+# === OS / editor ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

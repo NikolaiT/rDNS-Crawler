@@ -1,0 +1,31 @@
+[Unit]
+Description=rDNS-Crawler shard @SHARD_ID@/@SHARDS@
+After=network-online.target unbound.service
+Wants=network-online.target unbound.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rdns
+# Never start crawling before the local resolver actually answers — otherwise
+# every query fails instantly and we poison the shard with bogus net_error
+# records (this bit us once: cloud-init was still installing unbound).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 150); do unbound-control status >/dev/null 2>&1 && exit 0; sleep 2; done; echo "unbound never became ready" >&2; exit 1'
+# Resume from the on-disk cursor on every (re)start; use the node's local
+# unbound recursive resolver instead of public resolvers.
+ExecStart=/opt/rdns/rdns-crawler crawl \
+  --shards @SHARDS@ --shard-id @SHARD_ID@ \
+  --resume \
+  --resolvers 127.0.0.1:53 \
+  --concurrency @CONCURRENCY@ \
+  --timeout @TIMEOUT@ \
+  --retries @RETRIES@ \
+  --limit @LIMIT@ \
+  --sample-percent @SAMPLE_PERCENT@ \
+  --out /opt/rdns/OUTPUT/shard-@SHARD_ID@.rdnsz
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1048576
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
