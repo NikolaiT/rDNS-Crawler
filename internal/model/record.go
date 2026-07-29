@@ -1,6 +1,11 @@
 // Package model defines the shapes shared across the crawler.
 package model
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Status values for a single rDNS lookup. These are the string form used in
 // JSONL output and logs. The compact .rdnsz store uses the numeric StatusCode
 // below (a stable 4-bit code) so the taxonomy can grow without breaking files.
@@ -78,6 +83,47 @@ func Code(status string) StatusCode {
 		return c
 	}
 	return CodeNetError
+}
+
+// StatusMask is a bit-set of StatusCodes (bit i set = code i included). Used to
+// select which previously-observed statuses a re-crawl pass should target.
+type StatusMask uint16
+
+// Has reports whether the mask includes the given status code.
+func (m StatusMask) Has(c StatusCode) bool { return m&(1<<c) != 0 }
+
+// String renders the mask as a comma-separated status list (stable code order).
+func (m StatusMask) String() string {
+	var parts []string
+	for c := StatusCode(0); c < NumStatusCodes; c++ {
+		if m.Has(c) {
+			parts = append(parts, StatusString(c))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// ParseStatuses parses a comma-separated status list (e.g. "has_ptr,timeout")
+// into a StatusMask. Unknown status names are an error (unlike Code, which
+// defaults) — a typo in a re-crawl plan must fail loudly, not silently target
+// the wrong set.
+func ParseStatuses(csv string) (StatusMask, error) {
+	var m StatusMask
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		c, ok := statusToCode[part]
+		if !ok {
+			return 0, fmt.Errorf("unknown status %q (valid: %s)", part, strings.Join(codeToStatus[:], ", "))
+		}
+		m |= 1 << c
+	}
+	if m == 0 {
+		return 0, fmt.Errorf("empty status list")
+	}
+	return m, nil
 }
 
 // StatusString maps a compact code back to its string (defaults to net_error).

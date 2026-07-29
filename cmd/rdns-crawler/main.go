@@ -3,13 +3,21 @@
 //
 // Modes:
 //
-//	test   Sample N random NON-reserved IPv4 addresses and resolve their PTR.
-//	crawl  Distributed full-space crawl. Shards the address space across N nodes
-//	       (ip %% shards == shard-id), resumes from a checkpoint, and writes the
-//	       compact .rdnsz format by default. This is what the Hetzner fleet runs.
-//	sweep  (legacy) Sequentially crawl a contiguous block; JSONL by default.
-//	dump   Read a .rdnsz file back to JSONL/text (for inspection or handoff to
-//	       rDNS-Processor).
+//	test     Sample N random NON-reserved IPv4 addresses and resolve their PTR.
+//	crawl    Distributed full-space crawl. Shards the address space across N nodes
+//	         (ip %% shards == shard-id), resumes from a checkpoint, and writes the
+//	         compact .rdnsz format by default. This is what the Hetzner fleet runs
+//	         on a first (baseline) pass.
+//	recrawl  Targeted update pass: re-crawl only the IPs of a previous pass's
+//	         .rdnsz shard whose status matched --statuses (default
+//	         has_ptr,timeout). This is what the fleet runs on every pass after
+//	         the first — ~43%% of the space instead of 100%%.
+//	compare  Join a previous pass with a re-crawl pass and print update
+//	         statistics (timeout recovery rate, PTR churn, transition matrix).
+//	info     Print .rdnsz header summaries (per file + aggregate).
+//	sweep    (legacy) Sequentially crawl a contiguous block; JSONL by default.
+//	dump     Read a .rdnsz file back to JSONL/text (for inspection or handoff to
+//	         rDNS-Processor).
 package main
 
 import (
@@ -27,6 +35,7 @@ import (
 	"syscall"
 	"time"
 
+	"rdns-crawler/internal/compare"
 	"rdns-crawler/internal/crawler"
 	"rdns-crawler/internal/ipgen"
 	"rdns-crawler/internal/model"
@@ -54,6 +63,12 @@ func main() {
 		runTest(os.Args[2:])
 	case "crawl":
 		runCrawl(os.Args[2:])
+	case "recrawl":
+		runRecrawl(os.Args[2:])
+	case "compare":
+		runCompare(os.Args[2:])
+	case "info":
+		runInfo(os.Args[2:])
 	case "sweep":
 		runSweep(os.Args[2:])
 	case "dump":
@@ -71,10 +86,13 @@ func usage() {
 	fmt.Fprint(os.Stderr, `rDNS-Crawler — reverse-DNS crawler for the IPv4 address space
 
 Usage:
-  rdns-crawler test  [flags]              Sample random non-reserved IPv4 → resolve PTR
-  rdns-crawler crawl [flags]              Distributed, sharded, resumable full-space crawl
-  rdns-crawler sweep [flags]              (legacy) crawl a contiguous IPv4 block
-  rdns-crawler dump  <file.rdnsz> [flags] Decode a .rdnsz file to JSONL/text
+  rdns-crawler test    [flags]              Sample random non-reserved IPv4 → resolve PTR
+  rdns-crawler crawl   [flags]              Distributed, sharded, resumable full-space crawl
+  rdns-crawler recrawl [flags]              Re-crawl a previous shard's has_ptr/timeout IPs
+  rdns-crawler compare [flags]              Statistics: previous pass vs re-crawl pass
+  rdns-crawler info    <file|dir> ...       Print .rdnsz header summaries
+  rdns-crawler sweep   [flags]              (legacy) crawl a contiguous IPv4 block
+  rdns-crawler dump    <file.rdnsz> [flags] Decode a .rdnsz file to JSONL/text
 
 Run "rdns-crawler <mode> -h" for flags.
 `)
@@ -240,6 +258,192 @@ func runCrawl(args []string) {
 		SampleThreshold: sampleThreshold,
 	})
 	pipeline(ctx, crw, ips, wr, cursor, cursorPath)
+}
+
+// runRecrawl re-crawls the IPs of a previous pass's .rdnsz shard whose status
+// is in --statuses. The shard identity (shards/shard-id) is inherited from the
+// old file's header, so the output slots into the same fleet layout and can be
+// compared 1:1 afterwards. Resume is count-based: the cursor stores how many
+// targets of the (deterministic) filtered stream have been handed to workers.
+func runRecrawl(args []string) {
+	fs := flag.NewFlagSet("recrawl", flag.ExitOnError)
+	common := registerCommon(fs, "rdnsz")
+	from := fs.String("from", "", "previous-pass .rdnsz shard to re-crawl from (required)")
+	statuses := fs.String("statuses", "has_ptr,timeout", "comma-separated previous statuses to re-crawl")
+	limit := fs.Uint64("limit", 0, "max targets to crawl this run (0 = all; useful for smoke tests)")
+	resume := fs.Bool("resume", false, "resume from the checkpoint file next to --out")
+	fs.Parse(args)
+
+	if *from == "" {
+		fatal(errors.New("recrawl: --from <previous-shard.rdnsz> is required"))
+	}
+	mask, err := model.ParseStatuses(*statuses)
+	if err != nil {
+		fatal(err)
+	}
+	oldHdr, err := store.ReadHeader(*from)
+	if err != nil {
+		fatal(fmt.Errorf("reading previous shard: %w", err))
+	}
+
+	// Full validation pass over the old file. This both hard-fails on a
+	// truncated/corrupt observation file (silently crawling a partial target
+	// set would poison the update) and gives us the exact expected total.
+	expected, err := store.CountTargets(*from, mask)
+	if err != nil {
+		fatal(fmt.Errorf("previous shard %s is not usable as a re-crawl plan: %w", *from, err))
+	}
+
+	outPath, err := common.outPath("recrawl")
+	if err != nil {
+		fatal(err)
+	}
+	cursorPath := outPath + ".cursor"
+	var skip uint64
+	if *resume {
+		if n, ok := readCountCursor(cursorPath); ok {
+			// Rewind one checkpoint interval: targets handed out but not yet
+			// completed when the previous run died are re-crawled (harmless
+			// duplicates) instead of skipped (holes).
+			if n > store.DefaultTargetCheckpoint {
+				skip = n - store.DefaultTargetCheckpoint
+			}
+			fmt.Fprintf(os.Stderr, "[rdns] resuming at target %d/%d (cursor %d, rewound one checkpoint)\n", skip, expected, n)
+		}
+	}
+
+	servers, err := common.resolverList()
+	if err != nil {
+		fatal(err)
+	}
+	res, err := resolver.New(servers, common.timeout, common.retries)
+	if err != nil {
+		fatal(err)
+	}
+	wr, err := common.newSink(outPath, oldHdr.Shards, oldHdr.ShardID, *resume)
+	if err != nil {
+		fatal(err)
+	}
+	crw := crawler.New(crawler.Config{
+		Concurrency: common.concurrency,
+		FCrDNS:      common.fcrdns,
+		QPS:         common.qps,
+		ProgressOut: os.Stderr,
+		ProgressInt: time.Second,
+	}, res)
+
+	fmt.Fprintf(os.Stderr, "[rdns] recrawl: shard %d/%d | %d targets (%s) from %s | timeout=%s retries=%d | concurrency=%d | %d resolvers\n",
+		oldHdr.ShardID, oldHdr.Shards, expected, mask, filepath.Base(*from),
+		common.timeout, common.retries, common.concurrency, len(res.Servers()))
+
+	ctx, stop := signalCtx()
+	defer stop()
+
+	ips, cursor, errch := store.StreamTargets(ctx, *from, mask, skip, *limit, 0)
+	go func() {
+		for n := range cursor {
+			writeCountCursor(cursorPath, n, expected)
+		}
+	}()
+	pipeline(ctx, crw, ips, wr, nil, "")
+	if err := <-errch; err != nil {
+		fatal(fmt.Errorf("target stream from %s failed mid-crawl: %w", *from, err))
+	}
+}
+
+// runCompare joins a previous pass with a re-crawl pass and prints the update
+// statistics (and optionally writes them as JSON).
+func runCompare(args []string) {
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	oldPath := fs.String("old", "", "previous pass: .rdnsz file or directory of shards (required)")
+	newPath := fs.String("new", "", "re-crawl pass: .rdnsz file or directory of shards (required)")
+	statuses := fs.String("statuses", "has_ptr,timeout", "previous statuses that formed the re-crawl target set")
+	jsonOut := fs.String("json", "", "also write the full stats as JSON to this path")
+	topTLDs := fs.Int("top-tlds", 20, "how many TLDs of gained PTRs to report")
+	fs.Parse(args)
+
+	if *oldPath == "" || *newPath == "" {
+		fatal(errors.New("compare: --old and --new are required"))
+	}
+	mask, err := model.ParseStatuses(*statuses)
+	if err != nil {
+		fatal(err)
+	}
+	res, err := compare.Run(compare.Options{
+		OldPath: *oldPath,
+		NewPath: *newPath,
+		Mask:    mask,
+		TopTLDs: *topTLDs,
+	}, os.Stderr)
+	if err != nil {
+		fatal(err)
+	}
+	res.RenderText(os.Stdout)
+	if *jsonOut != "" {
+		data, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			fatal(err)
+		}
+		if err := os.WriteFile(*jsonOut, data, 0o644); err != nil {
+			fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "[rdns] stats JSON written to %s\n", *jsonOut)
+	}
+}
+
+// runInfo prints header summaries (per file and aggregate) for .rdnsz files.
+func runInfo(args []string) {
+	var paths []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		fi, err := os.Stat(a)
+		if err != nil {
+			fatal(err)
+		}
+		if fi.IsDir() {
+			m, _ := filepath.Glob(filepath.Join(a, "*.rdnsz"))
+			paths = append(paths, m...)
+		} else {
+			paths = append(paths, a)
+		}
+	}
+	if len(paths) == 0 {
+		fatal(errors.New("usage: rdns-crawler info <file.rdnsz|dir> ..."))
+	}
+
+	var total uint64
+	var counts [model.NumStatusCodes]uint64
+	for _, p := range paths {
+		h, err := store.ReadHeader(p)
+		if err != nil {
+			fatal(err)
+		}
+		total += h.Total
+		for i := 0; i < model.NumStatusCodes; i++ {
+			counts[i] += h.Counts[i]
+		}
+		fmt.Printf("%-24s shard %2d/%d  total=%-12d has_ptr=%-12d timeout=%-12d created=%s\n",
+			filepath.Base(p), h.ShardID, h.Shards, h.Total,
+			h.Count(model.CodeHasPTR), h.Count(model.CodeTimeout),
+			time.Unix(h.Created, 0).UTC().Format("2006-01-02"))
+	}
+	if len(paths) > 1 {
+		fmt.Printf("\naggregate over %d files: total=%d\n", len(paths), total)
+	} else {
+		fmt.Printf("\ntotal=%d\n", total)
+	}
+	for c := model.StatusCode(0); c < model.NumStatusCodes; c++ {
+		if counts[c] == 0 {
+			continue
+		}
+		fmt.Printf("  %-16s %-13d %5.2f%%\n", model.StatusString(c), counts[c], 100*float64(counts[c])/float64(total))
+	}
+	recrawlSet := counts[model.CodeHasPTR] + counts[model.CodeTimeout]
+	if total > 0 && recrawlSet > 0 {
+		fmt.Printf("  re-crawl target set (has_ptr+timeout): %d (%.1f%%)\n", recrawlSet, 100*float64(recrawlSet)/float64(total))
+	}
 }
 
 func runSweep(args []string) {
@@ -412,6 +616,31 @@ func readCursor(path string) (uint32, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// Count cursor for recrawl mode: "<done>/<total>\n". The total is informative
+// (status.sh renders done/total as a percentage); only <done> is parsed back.
+func readCountCursor(path string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(data))
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	var n uint64
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func writeCountCursor(path string, done, total uint64) {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d/%d\n", done, total)), 0o644); err == nil {
+		os.Rename(tmp, path)
+	}
 }
 
 func writeCursor(path string, v uint32) {

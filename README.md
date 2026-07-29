@@ -94,6 +94,29 @@ node ../../rDNS-Processor/src/index.js analyze ../OUTPUT/collected
 node ../../rDNS-Processor/src/index.js process ../OUTPUT/collected
 ```
 
+### Quickstart: pass 2+ (targeted update crawl)
+
+Once a baseline exists in `OUTPUT/collected`, subsequent passes re-crawl only
+the IPs whose previous status is in `RECRAWL_STATUSES` (the current config uses
+`has_ptr,timeout,servfail` — 1.75B IPs, 47% of the space) — set in
+`deploy/config.env` via `MODE=recrawl` (plus a fresh `COLLECT_DIR` and a more
+patient `TIMEOUT`). The commands are identical:
+
+```bash
+cd deploy
+./up.sh && sleep 60 && ./deploy.sh   # deploy.sh also uploads each node's old shard (~57 MB)
+./status.sh                          # SWEPT column = done/total targets
+# ...days later...
+./collect.sh && ./down.sh
+
+# the payoff — update statistics (timeout recovery, PTR churn, transitions);
+# --statuses must match RECRAWL_STATUSES (collect.sh prints the exact command):
+cd ..
+./bin/rdns-crawler compare --old OUTPUT/collected --new OUTPUT/collected-pass2 \
+  --statuses has_ptr,timeout,servfail \
+  --json OUTPUT/collected-pass2/compare-stats.json
+```
+
 > The old `./collect.sh --merge` (which explodes the shards into a single flat
 > `merged.ptr.tsv`, `ipInt<TAB>ptr,ptr`) is still available but **no longer
 > needed** — it's ~10× larger than the `.rdnsz` shards and drops the fcrdns /
@@ -177,6 +200,78 @@ gets stuck on a densely-populated block.
 
 For the managed 5-node Hetzner deployment, see **[`deploy/README.md`](deploy/README.md)**.
 
+### Recrawl mode (targeted update pass)
+
+After a baseline pass, you never sweep all 3.7B addresses again. `recrawl`
+streams its targets from a previous pass's `.rdnsz` shard and re-queries only
+the IPs whose previous status is in `--statuses`:
+
+```bash
+# re-crawl shard 3's previous hits + timeouts, with a more patient timeout
+./bin/rdns-crawler recrawl --from OUTPUT/collected/shard-3.rdnsz \
+  --statuses has_ptr,timeout --resume \
+  --resolvers 127.0.0.1:53 --concurrency 800 --timeout 5s --retries 2 \
+  --out OUTPUT/pass2/shard-3.rdnsz
+```
+
+- The default target set `has_ptr,timeout` covers **what can change** (existing
+  PTRs → churn detection) and **what the previous tuning missed** (timeouts —
+  raise `--timeout` so slow authoritative servers finally answer). After the
+  2026-07 baseline that is 1.60B of 3.70B IPs (43%). Adding `servfail` (as the
+  fleet config does) also revisits broken delegations that may have been fixed
+  (+147M IPs).
+- Shard identity (`shards`/`shard-id`) is **inherited from the old file's
+  header**, so a fleet of N nodes re-crawls old shard *i* on node *i* and the
+  outputs line up 1:1 with the baseline for `compare`.
+- The old file is fully validated first (a truncated plan file is a hard error),
+  and the exact target count is known up front.
+- `--resume` uses a count cursor (`<out>.cursor`, `done/total` format): the
+  filtered target stream is deterministic, so "skip the first N" is an exact
+  resume. On restart it rewinds one checkpoint (~131K targets) so in-flight
+  losses become harmless duplicates instead of holes.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--from` | — | previous-pass `.rdnsz` shard (required) |
+| `--statuses` | `has_ptr,timeout` | previous statuses to re-crawl |
+| `--resume` | `false` | resume from the `<out>.cursor` checkpoint |
+| `--limit` | `0` | cap targets this run (smoke tests) |
+
+plus all common flags (`--timeout`, `--retries`, `--concurrency`, …).
+
+### Compare mode (update statistics)
+
+`compare` joins a previous pass with its re-crawl and reports what the update
+actually bought — per shard pair (old shard *i* ↔ new shard *i*), streamed, at
+~1.3 GB peak RAM for 20×80M-target shards:
+
+```bash
+./bin/rdns-crawler compare --old OUTPUT/collected --new OUTPUT/collected-pass2 \
+  --json OUTPUT/collected-pass2/compare-stats.json
+```
+
+Reported (text + optional JSON):
+
+- **Timeout recovery**: of the previously timed-out set, the % that now yields
+  a PTR, the % now definitive (`has_ptr`/`nxdomain`/`noerror_empty`), the %
+  still timing out — plus the full transition breakdown.
+- **PTR churn**: of the previously valid set, the % unchanged / changed
+  (order/case-insensitive PTR-set comparison) / authoritatively removed /
+  transiently failing, with a per-day churn rate.
+- **FCrDNS shifts** (confirmed → unconfirmed and vice versa), **net PTR
+  movement** (gained from timeouts vs. authoritatively lost), and the **top
+  TLDs of recovered PTRs** (what the timeout set turned out to be).
+- Bookkeeping: targets not yet crawled, duplicates from restarts, truncated
+  shards (comparing while the fleet still runs is fine).
+
+### Info mode
+
+Header summaries without decoding the data:
+
+```bash
+./bin/rdns-crawler info OUTPUT/collected            # per shard + aggregate
+```
+
 ### Sweep mode (legacy)
 
 Sequentially crawl a contiguous block; superseded by `crawl` for real work.
@@ -244,13 +339,14 @@ One JSON object per line:
 ## Project structure
 
 ```
-cmd/rdns-crawler/main.go   CLI: test / crawl / sweep / dump
+cmd/rdns-crawler/main.go   CLI: test / crawl / recrawl / compare / info / sweep / dump
 internal/ipgen             reserved ranges + random / sequential / sharded generators
 internal/resolver          PTR + A lookups over UDP, resolver rotation, retries, rcode capture
 internal/crawler           parallel worker pool, FCrDNS, progress, QPS limiter
-internal/store             compact .rdnsz v2 writer/reader (+ round-trip tests)
+internal/store             compact .rdnsz v2 writer/reader + target streaming (+ tests)
+internal/compare           pass-vs-pass update statistics (recovery, churn, transitions)
 internal/output            JSONL writer + console summary table
-internal/model             shared Record type + status taxonomy
+internal/model             shared Record type + status taxonomy + status masks
 deploy/                    Hetzner Cloud fleet: up / deploy / status / collect / down
 DESIGN.md                  commercial master-DB / updater / scheduler architecture
 ```

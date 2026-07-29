@@ -1,0 +1,32 @@
+[Unit]
+Description=rDNS-Crawler re-crawl shard @SHARD_ID@/@SHARDS@ (targets: @RECRAWL_STATUSES@)
+After=network-online.target unbound.service
+Wants=network-online.target unbound.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rdns
+# Never start crawling before the local resolver actually answers — otherwise
+# every query fails instantly and we poison the shard with bogus net_error
+# records (this bit us once: cloud-init was still installing unbound).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 150); do unbound-control status >/dev/null 2>&1 && exit 0; sleep 2; done; echo "unbound never became ready" >&2; exit 1'
+# Re-crawl only the IPs whose previous status is in --statuses, streamed from
+# the previous pass's shard file (uploaded by deploy.sh). Shard identity is
+# inherited from that file's header. Resume is count-based via the .cursor file.
+ExecStart=/opt/rdns/rdns-crawler recrawl \
+  --from /opt/rdns/prev-shard-@SHARD_ID@.rdnsz \
+  --statuses @RECRAWL_STATUSES@ \
+  --resume \
+  --resolvers 127.0.0.1:53 \
+  --concurrency @CONCURRENCY@ \
+  --timeout @TIMEOUT@ \
+  --retries @RETRIES@ \
+  --limit @LIMIT@ \
+  --out /opt/rdns/OUTPUT/shard-@SHARD_ID@.rdnsz
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1048576
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

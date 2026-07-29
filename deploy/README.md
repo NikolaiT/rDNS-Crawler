@@ -57,6 +57,27 @@ The sample is a deterministic hash of the IP, so re-runs hit the same set and
 each node still resumes from its own cursor. Nothing else changes between a test
 and a full run except this number.
 
+### Baseline pass vs. update pass (`MODE`)
+
+`MODE` in `config.env` selects what each node crawls:
+
+- `MODE=crawl` — the full-space **baseline** pass described above.
+- `MODE=recrawl` — the targeted **update** pass: each node re-crawls only the
+  IPs of the previous pass whose status is in `RECRAWL_STATUSES` (default
+  `has_ptr,timeout` — the set that can change plus the set the previous tuning
+  missed; ~43% of the space after a first full sweep).
+
+In recrawl mode, `deploy.sh` uploads `OLD_COLLECTED_DIR/shard-<i>.rdnsz`
+(~57 MB) to node *i* as its crawl plan — so **`NODES` must equal the previous
+pass's shard count** (enforced). Set `COLLECT_DIR` to a fresh directory so
+`collect.sh` doesn't overwrite the baseline; when collection is done it prints
+the ready-to-run `rdns-crawler compare` command that produces the update
+statistics (timeout recovery rate, PTR churn, transition matrix).
+
+Raise `TIMEOUT` for the update pass (see the tuning comment in
+`config.env.example`): recovering previously timed-out IPs is the whole point,
+and the smaller target set easily affords the patience.
+
 ## Run
 
 ```bash
@@ -89,21 +110,26 @@ node ../../rDNS-Processor/src/index.js process ../OUTPUT/collected
 | Script | Purpose |
 |--------|---------|
 | `up.sh` | Create the fleet (one node per shard) with cloud-init. Idempotent. |
-| `deploy.sh` | Cross-compile `linux/amd64`, push binary + `rdns-crawler.service`, start/restart each shard (resumes from cursor). Re-runnable. |
-| `status.sh` | Per-node service state, resume cursor, and output size. |
-| `collect.sh` | `rsync` shard `.rdnsz` files to `../OUTPUT/collected/` (feed this dir straight to `rDNS-Processor`); legacy `--merge` also explodes them into a flat `merged.ptr.tsv`. |
+| `deploy.sh` | Cross-compile `linux/amd64`, push binary + systemd unit (+ the previous shard file in `MODE=recrawl`), start/restart each shard (resumes from cursor). Re-runnable. |
+| `status.sh` | Per-node service state, resume cursor/progress, and output size. |
+| `collect.sh` | `rsync` shard `.rdnsz` files to `COLLECT_DIR` (feed this dir straight to `rDNS-Processor`); legacy `--merge` also explodes them into a flat `merged.ptr.tsv`. |
 | `down.sh` | Delete all fleet servers (confirm with `delete`, or `--yes`). |
-| `lib.sh` | Shared Hetzner API + SSH helpers. |
+| `lib.sh` | Shared Hetzner API + SSH helpers + config validation. |
 | `cloud-init.yaml` | Node bootstrap: unbound, sysctl/ulimits, `/opt/rdns`. |
-| `rdns-crawler.service.tmpl` | systemd unit template (shard/concurrency/etc. substituted per node). |
+| `rdns-crawler.service.tmpl` | systemd unit template for `MODE=crawl` (shard/concurrency/etc. substituted per node). |
+| `rdns-recrawl.service.tmpl` | systemd unit template for `MODE=recrawl` (streams targets from the uploaded previous shard). |
 
 ## Operational notes
 
-- **Resume**: each shard checkpoints `OUTPUT/shard-<id>.rdnsz.cursor` (the last
-  IP it swept). The systemd unit runs with `--resume`, so a reboot or `deploy.sh`
-  re-run continues from that cursor and **appends** to the existing `.rdnsz`
-  (its cumulative header stats are preserved). Resume refuses to write if the
-  file belongs to a different shard, guarding against a misconfigured `--out`.
+- **Resume**: each shard checkpoints `OUTPUT/shard-<id>.rdnsz.cursor`. In
+  `crawl` mode the cursor is the last IP swept; in `recrawl` mode it is
+  `done/total` counts into the target stream (resume rewinds one checkpoint, so
+  a crash re-crawls up to ~131K targets rather than skipping in-flight ones —
+  duplicates are dedup'd by `compare` and the updater). The systemd unit runs
+  with `--resume`, so a reboot or `deploy.sh` re-run continues from that cursor
+  and **appends** to the existing `.rdnsz` (its cumulative header stats are
+  preserved). Resume refuses to write if the file belongs to a different shard,
+  guarding against a misconfigured `--out`.
 - **Tuning**: raise `CONCURRENCY` in `config.env` if nodes are CPU/network idle;
   `unbound` on `cx23` (4 threads) handles high concurrency comfortably.
 - **Cost control**: `./down.sh` deletes the servers. Always `./collect.sh` first.

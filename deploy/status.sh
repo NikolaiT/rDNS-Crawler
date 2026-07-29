@@ -43,11 +43,16 @@ for row in "${rows[@]}"; do
     [[ "$svc" == active ]] && t_rate=$((t_rate + ${rate%/s}))
   fi
 
-  # Sweep column: finished shards → done/FAILED; running → cursor as a rough
-  # fraction of the 32-bit space (approximate: ignores reserved gaps).
+  # Sweep column: finished shards → done/FAILED; running → progress from the
+  # cursor. Two cursor formats exist: "a.b.c.d" (crawl mode: position in the
+  # 32-bit space, approximate — ignores reserved gaps) and "done/total"
+  # (recrawl mode: exact fraction of the shard's target set).
   if [[ "$svc" == active ]]; then
     pct="-"
-    if [[ "$cur" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    if [[ "$cur" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+      pct=$(awk -v n="${BASH_REMATCH[1]}" -v t="${BASH_REMATCH[2]}" \
+        'BEGIN { if (t > 0) printf "%.1f%%", n / t * 100; else print "-" }')
+    elif [[ "$cur" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
       pct=$(awk -v a="${BASH_REMATCH[1]}" -v b="${BASH_REMATCH[2]}" -v c="${BASH_REMATCH[3]}" -v d="${BASH_REMATCH[4]}" \
         'BEGIN { printf "%.1f%%", (a*2^24 + b*2^16 + c*2^8 + d) / 2^32 * 100 }')
     fi

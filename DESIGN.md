@@ -5,9 +5,13 @@ sellable reverse-DNS dataset** for the whole IPv4 space, and how re-crawls are
 scheduled intelligently so the data stays fresh without re-querying 3.7 billion
 addresses blindly every cycle.
 
-Status: the **crawler + observation format (`.rdnsz` v2)** are implemented. The
-**master state DB, updater, zone prober, and scheduler** described here are the
-next build; this doc is the spec.
+Status: the **crawler + observation format (`.rdnsz` v2)** are implemented, and
+so is the first slice of the update strategy: **`recrawl`** (status-filtered
+re-crawl of a previous pass — the simplest form of the due-set idea in §5,
+targeting `has_ptr` + `timeout`) and **`compare`** (pass-vs-pass statistics:
+timeout recovery, PTR churn, transition matrix — the measurement layer the
+scheduler's TTL policy will feed on). The **master state DB, updater, zone
+prober, and scheduler** described here are the next build; this doc is the spec.
 
 ---
 
@@ -242,6 +246,12 @@ Designed-in for later (fields already captured, no re-crawl needed to start):
 
 ## 7. Build order (proposed next steps)
 
+0. ~~Status-filtered re-crawl + pass comparison~~ — **done**: `recrawl` streams
+   the `has_ptr`/`timeout` targets straight from a previous pass's `.rdnsz`
+   shard (no master DB needed yet), and `compare` measures the outcome
+   (recovery rate, churn, transitions). This de-risks the scheduler design: the
+   churn/recovery numbers it produces are exactly the inputs the TTL policy in
+   §5 needs.
 1. `internal/masterdb`: mmap'd `state.bin` + PTR dictionary; `Get/Apply` API.
 2. `cmd/rdns-db merge <*.rdnsz>`: updater that folds observation files into the
    master DB (with the grace policy).

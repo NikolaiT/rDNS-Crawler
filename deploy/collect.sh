@@ -16,7 +16,9 @@ load_config
 merge=false
 [[ "${1:-}" == "--merge" ]] && merge=true
 
-dest="$ROOT_DIR/OUTPUT/collected"
+# COLLECT_DIR comes from config.env. For a recrawl pass it MUST differ from
+# OLD_COLLECTED_DIR (lib.sh enforces this) so the baseline is never clobbered.
+dest="$(abs_path "$COLLECT_DIR")"
 mkdir -p "$dest"
 
 rows=()
@@ -36,6 +38,14 @@ done
 echo
 info "collected files:"
 ls -lh "$dest"/*.rdnsz 2>/dev/null || info "  none yet"
+if [[ "$MODE" == "recrawl" ]]; then
+  info "re-crawl pass collected. Compare against the previous pass:"
+  echo "  (cd $ROOT_DIR && ./bin/rdns-crawler compare \\"
+  echo "     --old $(abs_path "$OLD_COLLECTED_DIR") \\"
+  echo "     --new $dest \\"
+  echo "     --statuses $RECRAWL_STATUSES \\"
+  echo "     --json $dest/compare-stats.json)"
+fi
 if ! $merge; then
   info "feed the shards straight to rDNS-Processor (no merge needed):"
   echo "  node ../rDNS-Processor/src/index.js process $dest"

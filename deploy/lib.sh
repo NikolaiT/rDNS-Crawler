@@ -30,8 +30,28 @@ load_config() {
   : "${RETRIES:=2}"
   : "${LIMIT:=0}"
   : "${SAMPLE_PERCENT:=100}"
+  # MODE=crawl → full-space baseline pass; MODE=recrawl → targeted update pass
+  # that re-crawls only the OLD_COLLECTED_DIR IPs whose previous status is in
+  # RECRAWL_STATUSES. COLLECT_DIR is where collect.sh puts this pass's shards
+  # (keep it different from OLD_COLLECTED_DIR or you overwrite the baseline!).
+  : "${MODE:=crawl}"
+  : "${OLD_COLLECTED_DIR:=OUTPUT/collected}"
+  : "${RECRAWL_STATUSES:=has_ptr,timeout}"
+  : "${COLLECT_DIR:=OUTPUT/collected}"
+  [[ "$MODE" == "crawl" || "$MODE" == "recrawl" ]] || die "MODE must be 'crawl' or 'recrawl', got '$MODE'"
+  if [[ "$MODE" == "recrawl" && "$COLLECT_DIR" == "$OLD_COLLECTED_DIR" ]]; then
+    die "recrawl would overwrite the previous pass: set COLLECT_DIR different from OLD_COLLECTED_DIR"
+  fi
   command -v jq >/dev/null || die "jq is required (brew install jq)"
   command -v curl >/dev/null || die "curl is required"
+}
+
+# abs_path <path> — resolve relative to the repo root.
+abs_path() {
+  case "$1" in
+    /*) echo "$1" ;;
+    *)  echo "$ROOT_DIR/$1" ;;
+  esac
 }
 
 # api METHOD PATH [json-body]
