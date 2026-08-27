@@ -14,6 +14,9 @@
 //	         the first — ~43%% of the space instead of 100%%.
 //	compare  Join a previous pass with a re-crawl pass and print update
 //	         statistics (timeout recovery rate, PTR churn, transition matrix).
+//	merge    Fold a re-crawl pass into its baseline pass and write the merged
+//	         full-space shards (the updated dataset: new observations win,
+//	         known-good PTRs survive transient failures).
 //	info     Print .rdnsz header summaries (per file + aggregate).
 //	sweep    (legacy) Sequentially crawl a contiguous block; JSONL by default.
 //	dump     Read a .rdnsz file back to JSONL/text (for inspection or handoff to
@@ -38,6 +41,7 @@ import (
 	"rdns-crawler/internal/compare"
 	"rdns-crawler/internal/crawler"
 	"rdns-crawler/internal/ipgen"
+	"rdns-crawler/internal/merge"
 	"rdns-crawler/internal/model"
 	"rdns-crawler/internal/output"
 	"rdns-crawler/internal/resolver"
@@ -67,6 +71,8 @@ func main() {
 		runRecrawl(os.Args[2:])
 	case "compare":
 		runCompare(os.Args[2:])
+	case "merge":
+		runMerge(os.Args[2:])
 	case "info":
 		runInfo(os.Args[2:])
 	case "sweep":
@@ -90,6 +96,7 @@ Usage:
   rdns-crawler crawl   [flags]              Distributed, sharded, resumable full-space crawl
   rdns-crawler recrawl [flags]              Re-crawl a previous shard's has_ptr/timeout IPs
   rdns-crawler compare [flags]              Statistics: previous pass vs re-crawl pass
+  rdns-crawler merge   [flags]              Fold a re-crawl pass into its baseline (updated dataset)
   rdns-crawler info    <file|dir> ...       Print .rdnsz header summaries
   rdns-crawler sweep   [flags]              (legacy) crawl a contiguous IPv4 block
   rdns-crawler dump    <file.rdnsz> [flags] Decode a .rdnsz file to JSONL/text
@@ -388,6 +395,49 @@ func runCompare(args []string) {
 			fatal(err)
 		}
 		fmt.Fprintf(os.Stderr, "[rdns] stats JSON written to %s\n", *jsonOut)
+	}
+}
+
+// runMerge folds a re-crawl pass into its baseline and writes the merged
+// full-space shards — the dataset the commercial export ships and the next
+// re-crawl's baseline.
+func runMerge(args []string) {
+	fs := flag.NewFlagSet("merge", flag.ExitOnError)
+	oldPath := fs.String("old", "", "baseline pass: .rdnsz file or directory of shards (required)")
+	newPath := fs.String("new", "", "re-crawl pass: .rdnsz file or directory of shards (required)")
+	outDir := fs.String("out", "", "output directory for the merged shards (required)")
+	statuses := fs.String("statuses", "has_ptr,timeout", "previous statuses that formed the re-crawl target set")
+	jsonOut := fs.String("json", "", "also write the merge stats as JSON to this path")
+	allowPartial := fs.Bool("allow-partial", false, "tolerate missing/truncated new shards (their targets keep the baseline record)")
+	fs.Parse(args)
+
+	if *oldPath == "" || *newPath == "" || *outDir == "" {
+		fatal(errors.New("merge: --old, --new and --out are required"))
+	}
+	mask, err := model.ParseStatuses(*statuses)
+	if err != nil {
+		fatal(err)
+	}
+	res, err := merge.Run(merge.Options{
+		OldPath:      *oldPath,
+		NewPath:      *newPath,
+		OutDir:       *outDir,
+		Mask:         mask,
+		AllowPartial: *allowPartial,
+	}, os.Stderr)
+	if err != nil {
+		fatal(err)
+	}
+	res.RenderText(os.Stdout)
+	if *jsonOut != "" {
+		data, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			fatal(err)
+		}
+		if err := os.WriteFile(*jsonOut, data, 0o644); err != nil {
+			fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "[rdns] merge stats JSON written to %s\n", *jsonOut)
 	}
 }
 

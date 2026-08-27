@@ -115,6 +115,17 @@ cd ..
 ./bin/rdns-crawler compare --old OUTPUT/collected --new OUTPUT/collected-pass2 \
   --statuses has_ptr,timeout,servfail \
   --json OUTPUT/collected-pass2/compare-stats.json
+
+# fold the update into the baseline → the new full-space dataset (what the
+# commercial export ships, and the next pass's baseline). New observations win;
+# a known-good PTR survives a transient timeout/servfail (grace policy) and is
+# only removed by an authoritative nxdomain/noerror_empty:
+./bin/rdns-crawler merge --old OUTPUT/collected --new OUTPUT/collected-pass2 \
+  --statuses has_ptr,timeout,servfail \
+  --out OUTPUT/merged-$(date +%F) \
+  --json OUTPUT/merged-$(date +%F)/merge-stats.json
+# → point rDNS-Processor / the export at OUTPUT/merged-<date>, and set it as
+#   OLD_COLLECTED_DIR for pass 3.
 ```
 
 > The old `./collect.sh --merge` (which explodes the shards into a single flat

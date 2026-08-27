@@ -116,6 +116,10 @@ func (w *Writer) Consume(ch <-chan model.Record) {
 	}
 }
 
+// Add appends a single record — the non-channel entry point for batch
+// producers (the merge updater) that don't run a crawl pipeline.
+func (w *Writer) Add(rec model.Record) { w.add(rec) }
+
 func (w *Writer) add(rec model.Record) {
 	w.Total++
 	w.counts[model.Code(rec.Status)]++

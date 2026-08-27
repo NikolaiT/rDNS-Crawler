@@ -74,6 +74,17 @@ pass's shard count** (enforced). Set `COLLECT_DIR` to a fresh directory so
 the ready-to-run `rdns-crawler compare` command that produces the update
 statistics (timeout recovery rate, PTR churn, transition matrix).
 
+After comparing, fold the pass into the baseline with `rdns-crawler merge`
+(see the main README): the merged directory is the updated full-space dataset —
+feed it to the export / rDNS-Processor and use it as `OLD_COLLECTED_DIR` for
+the next pass.
+
+> The whole post-collection chain (verify → compare → merge → `dataset-current`
+> symlink → commercial export) is automated by
+> [`rDNS-Processor/update.sh`](../../rDNS-Processor/update.sh); the end-to-end
+> runbook with all operational gotchas lives in
+> [`rDNS-Processor/UPDATE-PLAYBOOK.md`](../../rDNS-Processor/UPDATE-PLAYBOOK.md).
+
 Raise `TIMEOUT` for the update pass (see the tuning comment in
 `config.env.example`): recovering previously timed-out IPs is the whole point,
 and the smaller target set easily affords the patience.

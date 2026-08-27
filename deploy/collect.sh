@@ -38,8 +38,42 @@ done
 echo
 info "collected files:"
 ls -lh "$dest"/*.rdnsz 2>/dev/null || info "  none yet"
+
+# --- verify: every expected shard present with a clean (finalized) header ----
+# A shard whose node is still crawling has a zero-filled header (the crawler
+# only patches magic+stats on clean close) and fails the check: collect again
+# after the node's rdns-crawler/rdns-recrawl service is inactive.
+bin="$ROOT_DIR/bin/rdns-crawler"
+if [[ -x "$bin" ]]; then
+  echo
+  ok=0; bad=(); missing=()
+  for ((s = 0; s < NODES; s++)); do
+    f="$dest/shard-${s}.rdnsz"
+    if [[ ! -f "$f" ]]; then
+      missing+=("$s")
+    elif "$bin" info "$f" >/dev/null 2>&1; then
+      ok=$((ok + 1))
+    else
+      bad+=("$s")
+    fi
+  done
+  if [[ $ok -eq $NODES ]]; then
+    info "verify: all $NODES shards present with finalized headers ✓"
+  else
+    info "verify: $ok/$NODES shards complete"
+    [[ ${#missing[@]} -gt 0 ]] && info "  MISSING: shards ${missing[*]}"
+    [[ ${#bad[@]} -gt 0 ]] && info "  PARTIAL (node still crawling? header not finalized): shards ${bad[*]}"
+    info "  re-run ./collect.sh once the node(s) show 'inactive done' in ./status.sh"
+  fi
+else
+  info "verify skipped: $bin not built (go build -o bin/rdns-crawler ./cmd/rdns-crawler)"
+fi
+
 if [[ "$MODE" == "recrawl" ]]; then
-  info "re-crawl pass collected. Compare against the previous pass:"
+  info "re-crawl pass collected. Run the full update pipeline (verify → compare"
+  info "→ merge → export) with one command:"
+  echo "  ../../rDNS-Processor/update.sh --pass $dest"
+  info "or just the comparison statistics:"
   echo "  (cd $ROOT_DIR && ./bin/rdns-crawler compare \\"
   echo "     --old $(abs_path "$OLD_COLLECTED_DIR") \\"
   echo "     --new $dest \\"
